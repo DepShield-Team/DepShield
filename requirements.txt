@@ -2,4 +2,5 @@
 tree-sitter
 tree-sitter-javascript
 tree-sitter-typescript
-
+aiohttp
+pytest
