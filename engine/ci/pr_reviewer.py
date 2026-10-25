@@ -4,6 +4,7 @@ import os
 import sys
 import urllib.request
 from pathlib import Path
+import aiohttp
 
 # Step 2: Line diff isolation
 from engine.ci.git_diff import get_pr_modified_lines
@@ -19,17 +20,19 @@ try:
 except ImportError:
     extract_javascript_imports = None
 
-# Member 3: Verification pipeline
+# Member 3: Verification pipeline and Cache
 try:
     from engine.pipeline import verify_dependencies
+    from engine.cache import ResponseCache
 except ImportError:
     verify_dependencies = None
+    ResponseCache = None
 
 
 def post_github_pr_comment(token: str, repo: str, pr_number: str, comment_body: str):
     """
     Posts an automated review comment to the GitHub Pull Request
-    using Python standard library (urllib.request), requiring zero extra dependencies.
+    using Python's standard library (urllib.request).
     """
     url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
     headers = {
@@ -49,17 +52,12 @@ def post_github_pr_comment(token: str, repo: str, pr_number: str, comment_body: 
         print(f"⚠️ Failed to post GitHub comment: {e}")
 
 
-async def fallback_check_pypi(package_name: str) -> bool:
-    """Fallback check directly against PyPI if pipeline module is loading."""
+async def fallback_check_pypi(session: aiohttp.ClientSession, package_name: str) -> bool:
+    """Fallback check directly against PyPI if pipeline is unavailable."""
     url = f"https://pypi.org/pypi/{package_name}/json"
-    req = urllib.request.Request(url, headers={"User-Agent": "DepShield-Fallback"})
     try:
-        with urllib.request.urlopen(req) as resp:
+        async with session.get(url, timeout=5.0) as resp:
             return resp.status == 200
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return False
-        return True
     except Exception:
         return True
 
@@ -96,6 +94,7 @@ async def run_ci_audit():
             except Exception as e:
                 print(f"⚠️ JS/TS parser error on {file_path}: {e}")
 
+        # Keep only imports introduced in the newly added PR lines
         for item in raw_imports:
             if item["line"] in added_lines:
                 imports_to_verify.append({
@@ -110,30 +109,34 @@ async def run_ci_audit():
 
     print(f"🔍 Inspecting {len(imports_to_verify)} newly introduced import statements...")
 
-    # 3. Verify via Member 3's pipeline or fallback check
     critical_findings = []
 
-    if verify_dependencies:
-        results = await verify_dependencies(imports_to_verify)
-        for res in results:
-            if res.get("status") in {"NOT_FOUND", "CRITICAL"}:
-                critical_findings.append({
-                    "file": res.get("file", "unknown"),
-                    "line": res.get("line", "?"),
-                    "package": res.get("package"),
-                    "reason": "404 Not Found on public registry (Hallucinated dependency / Slopsquat target).",
-                })
-    else:
-        # Fallback check
-        for item in imports_to_verify:
-            exists = await fallback_check_pypi(item["package"])
-            if not exists:
-                critical_findings.append({
-                    "file": item["file"],
-                    "line": item["line"],
-                    "package": item["package"],
-                    "reason": "404 Not Found on PyPI (Hallucinated package).",
-                })
+    # 3. Verify via Member 3's pipeline with active aiohttp session and cache
+    async with aiohttp.ClientSession() as session:
+        if verify_dependencies and ResponseCache:
+            cache = ResponseCache()
+            # Pass all 3 required arguments to Member 3's pipeline
+            results = await verify_dependencies(imports_to_verify, session, cache)
+            for res in results:
+                # Member 3 flags non-existent packages as NOT_FOUND (404)
+                if res.get("status") in {"NOT_FOUND", "CRITICAL"}:
+                    critical_findings.append({
+                        "file": res.get("file", "unknown"),
+                        "line": res.get("line", "?"),
+                        "package": res.get("package"),
+                        "reason": "404 Not Found on PyPI/npm (Hallucinated package / Slopsquat target).",
+                    })
+        else:
+            # Fallback if Member 3's modules are not imported
+            for item in imports_to_verify:
+                exists = await fallback_check_pypi(session, item["package"])
+                if not exists:
+                    critical_findings.append({
+                        "file": item["file"],
+                        "line": item["line"],
+                        "package": item["package"],
+                        "reason": "404 Not Found on PyPI (Hallucinated package).",
+                    })
 
     # 4. Enforce security block on failures
     if critical_findings:
