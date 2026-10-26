@@ -118,13 +118,17 @@ async def run_ci_audit():
             # Pass all 3 required arguments to Member 3's pipeline
             results = await verify_dependencies(imports_to_verify, session, cache)
             for res in results:
-                # Member 3 flags non-existent packages as NOT_FOUND (404)
                 if res.get("status") in {"NOT_FOUND", "CRITICAL"}:
+                    # Match package name back to original import item to preserve the file path
+                    original_item = next(
+                        (i for i in imports_to_verify if i["package"] == res.get("package")),
+                        {}
+                    )
                     critical_findings.append({
-                        "file": res.get("file", "unknown"),
-                        "line": res.get("line", "?"),
+                        "file": res.get("file") or original_item.get("file", "unknown"),
+                        "line": res.get("line") or original_item.get("line", "?"),
                         "package": res.get("package"),
-                        "reason": "404 Not Found on PyPI/npm (Hallucinated package / Slopsquat target).",
+                        "reason": "404 Not Found on public registry (Hallucinated package / Slopsquat target).",
                     })
         else:
             # Fallback if Member 3's modules are not imported
